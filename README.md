@@ -6,7 +6,7 @@ two servers in this project: `local-server` and `remote-server`. Remote server
 simply serves up a simple REST API while the local server fetches data using
 this REST API.
 
-#Run
+#Running the application
 1. Clone the app
 2. Start up the remote server `slc run remote-server` from the project root.
 3. Start up the local server `slc run local-server` from the project root.
@@ -16,7 +16,7 @@ retrieved from the remote server by doing a GET request on Magazines in the
 explorer or by running `curl localhost:3000/api/Magazines`.
 
 
-##FAQs
+#FAQ - Frequently asked questions
 The following are common questions related to using the REST connector.
 
 - [How do you perform a GET request to a remote server](https://github.com/strongloop/loopback-example-rest-connector#how-do-you-perform-a-get-request-to-a-remote-server)
