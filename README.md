@@ -6,8 +6,6 @@
 - [Running the app](https://github.com/strongloop/loopback-example-rest-connector#running-the-app)
 - [FAQ](https://github.com/strongloop/loopback-example-rest-connector#faq)
 
----
-
 #Overview
 This example demonstrates basic usage of `loopback-connector-rest`. There are
 two servers in this project: `local-server` and `remote-server`. Remote server
@@ -23,13 +21,12 @@ You should see console messages on the local server. Verify the data has been
 retrieved from the remote server by doing a GET request on Magazines in the
 explorer or by running `curl localhost:3000/api/Magazines`.
 
-
 #FAQ
 The following are common questions related to using the REST connector.
 
 - [How do you perform a GET request to a remote server](https://github.com/strongloop/loopback-example-rest-connector#how-do-you-perform-a-get-request-to-a-remote-server)
 
-###How do you perform a GET request to a remote server?
+##How do you perform a GET request to a remote server?
 In this example, we have a REST API exposed in [model-config.json](https://github.com/strongloop/loopback-example-rest-connector/blob/master/external-server/server/model-config.json#L31)
 .
 
