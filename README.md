@@ -13,3 +13,8 @@ this REST API.
 You should see console messages on the local server. Verify the data has been
 retrieved from the remote server by doing a GET request on Magazines in the
 explorer or by running `curl localhost:3000/api/Magazines`.
+
+1. How do you perform a GET request to a remote server?
+See [./local-server/common/models/magazine.js](local-server/common/models/magazine.js)
+
+[strongloop-website]: http://strongloop.com/
