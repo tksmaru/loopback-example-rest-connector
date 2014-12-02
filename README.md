@@ -14,7 +14,7 @@ this REST API.
 
 #Running the app
 1. Clone the app
-2. Start up the remote server `slc run remote-server` from the project root.
+2. Start up the remote server `slc run external-server` from the project root.
 3. Start up the local server `slc run local-server` from the project root.
 
 You should see console messages on the local server. Verify the data has been
