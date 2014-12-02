@@ -6,6 +6,8 @@
 - [Running the app](https://github.com/strongloop/loopback-example-rest-connector#running-the-app)
 - [FAQ](https://github.com/strongloop/loopback-example-rest-connector#faq)
 
+---
+
 #Overview
 This example demonstrates basic usage of `loopback-connector-rest`. There are
 two servers in this project: `local-server` and `remote-server`. Remote server
