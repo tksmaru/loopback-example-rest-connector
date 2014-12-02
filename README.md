@@ -3,8 +3,8 @@
 #loopback-example-rest-connector
 
 - [Overview](https://github.com/strongloop/loopback-example-rest-connector#loopback-example-rest-connector)
-- [Running the app](https://github.com/strongloop/loopback-example-rest-connector#running-the-application)
-- [FAQ](https://github.com/strongloop/loopback-example-rest-connector#faq---frequently-asked-questions)
+- [Running the app](https://github.com/strongloop/loopback-example-rest-connector#running-the-app)
+- [FAQ](https://github.com/strongloop/loopback-example-rest-connector#faq)
 
 #Overview
 This example demonstrates basic usage of `loopback-connector-rest`. There are
