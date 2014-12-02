@@ -24,12 +24,18 @@ In this example, we have a REST API exposed in [model-config.json](https://githu
 .
 
 To make a request to the remote server, declare new datasource that uses the
-REST connector in the local [datasources.json](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L6-L20). A few
-things to note in this file is the `connector` property's value is `rest` and
-there is an `operations` property that takes an array of objects. This object
-has two properties `template` and `function`. The `template` property contains
-`method` which is the HTTP method type to perform the request with and `url`
-which is the URL to the remote resource. The `function` property is the name of
-the property you will use to trigger the request. For example, we name our
-property `find` because we will trigger the request using `Magazine.find()...`.
+REST connector in the local [datasources.json](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L6-L20).
+
+A few things to note in this file is the `connector` property's value is `rest` and
+there is an `operations` property that takes an array of objects.
+
+This object has two properties `template` and `function`.
+
+The `template` property contains `method` which is the HTTP method type to
+perform the request with and `url` which is the URL to the remote resource.
+
+The `function` property is the name of the property you will use to trigger the
+request. For example, we name our property `find` because we will trigger the
+request using `Magazine.find()...`.
+
 The idea is to use [`find`](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L16) to make a [`GET`](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L12) request to a [`url`](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L13) we specify.
