@@ -47,3 +47,5 @@ request. For example, we name our property `find` because we will trigger the
 request using `Magazine.find()...`.
 
 The idea is to use [`find`](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L16) to make a [`GET`](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L12) request to a [`url`](https://github.com/strongloop/loopback-example-rest-connector/blob/master/local-server/server/datasources.json#L13) we specify.
+
+[Back to top](https://github.com/strongloop/loopback-example-rest-connector#loopback-example-rest-connector)
