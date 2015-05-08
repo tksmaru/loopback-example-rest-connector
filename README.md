@@ -12,8 +12,8 @@ two servers in this project: `local-server` and `remote-server`. Remote server
 simply serves up a simple REST API while the local server fetches data using
 this REST API.
 
-#Running the app
-1. Clone the app
+#Running the application
+1. Clone the application.
 2. Start up the remote server `slc run external-server` from the project root.
 3. Start up the local server `slc run local-server` from the project root.
 
@@ -36,7 +36,7 @@ REST connector in the local [datasources.json](https://github.com/strongloop/loo
 A few things to note in this file is the `connector` property's value is `rest` and
 there is an `operations` property that takes an array of objects.
 
-This object has two properties `template` and `function`.
+This object has two properties: `template` and `function`.
 
 The `template` property contains `method` which is the HTTP method type to
 perform the request with and `url` which is the URL to the remote resource.
