@@ -8,8 +8,8 @@
 
 #Overview
 This example demonstrates basic usage of `loopback-connector-rest`. There are
-two servers in this project: `local-server` and `remote-server`. Remote server
-simply serves up a simple REST API while the local server fetches data using
+two servers in this project: `local-server` and `remote-server`. The remote server
+simply serves up a simple REST API, while the local server fetches data using
 this REST API.
 
 #Running the application
