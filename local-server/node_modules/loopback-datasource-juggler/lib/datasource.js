@@ -4,6 +4,7 @@
 var ModelBuilder = require('./model-builder.js').ModelBuilder;
 var ModelDefinition = require('./model-definition.js');
 var RelationDefinition = require('./relation-definition.js');
+var OberserverMixin = require('./observer');
 var jutil = require('./jutil');
 var utils = require('./utils');
 var ModelBaseClass = require('./model.js');
@@ -33,11 +34,10 @@ var slice = Array.prototype.slice;
 
 /**
  * LoopBack models can manipulate data via the DataSource object.
- * Attaching a `DataSource` to a `Model` adds instance methods and static methods to the `Model`;
- * some of the added methods may be remote methods.
+ * Attaching a `DataSource` to a `Model` adds instance methods and static methods to the `Model`.
  *
- * Define a data source for persisting models.
- * Typically, you create a DataSource by calling createDataSource() on the LoopBack object; for example:
+ * Define a data source to persist model data.
+ * To create a DataSource programmatically, call `createDataSource()` on the LoopBack object; for example:
  * ```js
  * var oracle = loopback.createDataSource({
  *   connector: 'oracle',
@@ -49,15 +49,10 @@ var slice = Array.prototype.slice;
  * ```
  *
  * All classes in single dataSource share same the connector type and
- * one database connection.  The `settings` argument is an object that can have the following properties:
- * - host
- * - port
- * - username
- * - password
- * - database
- * - debug (Boolean, default is false)
+ * one database connection.
  *
- * @desc For example, the following creates a DataSource, and waits for a connection callback.
+ * For example, the following creates a DataSource, and waits for a connection callback.
+ *
  * ```
  * var dataSource = new DataSource('mysql', { database: 'myapp_test' });
  * dataSource.define(...);
@@ -65,9 +60,22 @@ var slice = Array.prototype.slice;
  *     // work with database
  * });
  * ```
- * @class Define new DataSource
- * @param {String} name Type of dataSource connector (mysql, mongoose, oracle, redis)
- * @param {Object} settings Database-specific settings to establish connection (settings depend on specific connector).  See above.
+ * @class DataSource
+ * @param {String} [name] Optional name for datasource.
+ * @options {Object} settings Database-specific settings to establish connection (settings depend on specific connector).
+ * The table below lists a typical set for a relational database.
+ * @property {String} connector Database connector to use.  For any supported connector, can be any of:
+ *
+ * - The connector module from `require(connectorName)`.
+ * - The full name of the connector module, such as 'loopback-connector-oracle'.
+ * - The short name of the connector module, such as 'oracle'.
+ * - A local module under `./connectors/` folder.
+ * @property {String} host Database server host name.
+ * @property {String} port Database server port number.
+ * @property {String} username Database user name.
+ * @property {String} password Database password.
+ * @property {String} database Name of the database to use.
+ * @property {Boolean} debug Display debugging information. Default is false.
  */
 function DataSource(name, settings, modelBuilder) {
   if (!(this instanceof DataSource)) {
@@ -175,6 +183,8 @@ DataSource.prototype._setupConnector = function () {
         log(q || query, t1);
       };
     };
+    // Configure the connector instance to mix in observer functions
+    jutil.mixin(this.connector, OberserverMixin);
   }
 };
 
@@ -188,8 +198,8 @@ function connectorModuleNames(name) {
     }
   }
   // Only try the short name if the connector is not from StrongLoop
-  if(['mongodb', 'oracle', 'mysql', 'postgresql', 'mssql', 'rest', 'soap']
-    .indexOf(name) === -1) {
+  if (['mongodb', 'oracle', 'mysql', 'postgresql', 'mssql', 'rest', 'soap']
+      .indexOf(name) === -1) {
     names.push(name);
   }
   return names;
@@ -225,7 +235,7 @@ DataSource._resolveConnector = function (name, loader) {
   if (!connector) {
     error = util.format('\nWARNING: LoopBack connector "%s" is not installed ' +
       'as any of the following modules:\n\n %s\n\nTo fix, run:\n\n    npm install %s\n',
-      name, names.join('\n'), names[names.length -1]);
+      name, names.join('\n'), names[names.length - 1]);
   }
   return {
     connector: connector,
@@ -265,7 +275,7 @@ DataSource.prototype.setup = function (name, settings) {
 
   this.settings.debug = this.settings.debug || debug.enabled;
 
-  if(this.settings.debug) {
+  if (this.settings.debug) {
     debug('Settings: %j', this.settings);
   }
 
@@ -379,8 +389,8 @@ function isModelDataSourceAttached(model) {
  * @param scopes
  */
 DataSource.prototype.defineScopes = function (modelClass, scopes) {
-  if(scopes) {
-    for(var s in scopes) {
+  if (scopes) {
+    for (var s in scopes) {
       defineScope(modelClass, modelClass, s, scopes[s], {}, scopes[s].options);
     }
   }
@@ -429,15 +439,15 @@ DataSource.prototype.defineRelations = function (modelClass, relations) {
 
   // Set up the relations
   if (relations) {
-    Object.keys(relations).forEach(function(rn) {
+    Object.keys(relations).forEach(function (rn) {
       var r = relations[rn];
       assert(DataSource.relationTypes.indexOf(r.type) !== -1, "Invalid relation type: " + r.type);
       var targetModel, polymorphicName;
-      
+
       if (r.polymorphic && r.type !== 'belongsTo' && !r.model) {
         throw new Error('No model specified for polymorphic ' + r.type + ': ' + rn);
       }
-      
+
       if (r.polymorphic) {
         polymorphicName = typeof r.model === 'string' ? r.model : rn;
         if (typeof r.polymorphic === 'string') {
@@ -446,17 +456,17 @@ DataSource.prototype.defineRelations = function (modelClass, relations) {
           polymorphicName = r.polymorphic.as;
         }
       }
-      
+
       if (r.model) {
         targetModel = isModelClass(r.model) ? r.model : self.getModel(r.model, true);
       }
-      
+
       var throughModel = null;
       if (r.through) {
         throughModel = isModelClass(r.through) ? r.through : self.getModel(r.through, true);
       }
-      
-      if ((targetModel && !isModelDataSourceAttached(targetModel)) 
+
+      if ((targetModel && !isModelDataSourceAttached(targetModel))
         || (throughModel && !isModelDataSourceAttached(throughModel))) {
         // Create a listener to defer the relation set up
         createListener(rn, r, targetModel, throughModel);
@@ -484,13 +494,13 @@ DataSource.prototype.setupDataAccess = function (modelClass, settings) {
     // Check if the id property should be generated
     var idName = modelClass.definition.idName();
     var idProp = modelClass.definition.rawProperties[idName];
-    if(idProp && idProp.generated && this.connector.getDefaultIdType) {
+    if (idProp && idProp.generated && this.connector.getDefaultIdType) {
       // Set the default id type from connector's ability
       var idType = this.connector.getDefaultIdType() || String;
       idProp.type = idType;
       modelClass.definition.properties[idName].type = idType;
       if (settings.forceId) {
-        modelClass.validatesAbsenceOf(idName, { if: 'isNewRecord' });
+        modelClass.validatesAbsenceOf(idName, {if: 'isNewRecord'});
       }
     }
     if (this.connector.define) {
@@ -525,7 +535,7 @@ DataSource.prototype.setupDataAccess = function (modelClass, settings) {
  * The first (String) argument specifying the model name is required.
  * You can provide one or two JSON object arguments, to provide configuration options.
  * See [Model definition reference](http://docs.strongloop.com/display/DOC/Model+definition+reference) for details.
- * 
+ *
  * Simple example:
  * ```
  * var User = dataSource.createModel('User', {
@@ -546,7 +556,7 @@ DataSource.prototype.setupDataAccess = function (modelClass, settings) {
  * });
  * ```
  * You can also define an ACL when you create a new data source with the `DataSource.create()` method. For example:
- * 
+ *
  * ```js
  * var Customer = ds.createModel('Customer', {
  *       name: {
@@ -749,9 +759,9 @@ DataSource.prototype.defineProperty = function (model, prop, params) {
 /**
  * Drop each model table and re-create.
  * This method applies only to database connectors.  For MongoDB, it drops and creates indexes.
- * 
+ *
  * **WARNING**: Calling this function deletes all data! Use `autoupdate()` to preserve data.
- * 
+ *
  * @param {String} model Model to migrate.  If not present, apply to all models.  Can also be an array of Strings.
  * @param {Function} [callback] Callback function. Optional.
  *
@@ -784,15 +794,15 @@ DataSource.prototype.automigrate = function (models, cb) {
       return cb && process.nextTick(cb);
     }
 
-    var invalidModels = models.filter(function(m) {
+    var invalidModels = models.filter(function (m) {
       return !(m in attachedModels);
     });
 
     if (invalidModels.length) {
-      return process.nextTick(function() {
+      return process.nextTick(function () {
         if (cb) {
           cb(new Error('Cannot migrate models not attached to this datasource: ' +
-            invalidModels.join(' ')));
+          invalidModels.join(' ')));
         }
       });
     }
@@ -808,7 +818,7 @@ DataSource.prototype.automigrate = function (models, cb) {
  * @param {String} model Model to migrate.  If not present, apply to all models.  Can also be an array of Strings.
  * @param {Function} [cb] The callback function
  */
-DataSource.prototype.autoupdate = function(models, cb) {
+DataSource.prototype.autoupdate = function (models, cb) {
   this.freeze();
 
   if ((!cb) && ('function' === typeof models)) {
@@ -835,15 +845,15 @@ DataSource.prototype.autoupdate = function(models, cb) {
       return process.nextTick(cb);
     }
 
-    var invalidModels = models.filter(function(m) {
+    var invalidModels = models.filter(function (m) {
       return !(m in attachedModels);
     });
 
     if (invalidModels.length) {
-      return process.nextTick(function() {
+      return process.nextTick(function () {
         if (cb) {
           cb(new Error('Cannot migrate models not attached to this datasource: ' +
-            invalidModels.join(' ')));
+          invalidModels.join(' ')));
         }
       });
     }
@@ -1027,7 +1037,7 @@ DataSource.prototype.discoverForeignKeysSync = function (modelName, options) {
 /**
  * Retrieves a description of the foreign key columns that reference the given table's primary key columns
  * (the foreign keys exported by a table), ordered by fkTableOwner, fkTableName, and keySeq.
- * 
+ *
  * Callback function return value is an object that can have the following properties:
  *
  *| Key | Type | Description |
@@ -1092,7 +1102,7 @@ function fromDBName(dbName, camelCase) {
 
 /**
  * Discover one schema from the given model without following the relations.
-**Example schema from oracle connector:**
+ **Example schema from oracle connector:**
  *
  * ```js
  *     {
@@ -1190,11 +1200,36 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
   }
 
   var self = this;
-  var schemaName = this.connector.name || this.name;
+  var dbType = this.connector.name || this.name;
+
+  var nameMapper;
+  if (options.nameMapper === null) {
+    // No mapping
+    nameMapper = function(type, name) {
+      return name;
+    };
+  } else if (typeof options.nameMapper === 'function') {
+    // Custom name mapper
+    nameMapper = options.nameMapper;
+  } else {
+    // Default name mapper
+    nameMapper = function mapName(type, name) {
+      if (type === 'table' || type === 'model') {
+        return fromDBName(name, false);
+      } else {
+        return fromDBName(name, true);
+      }
+    };
+  }
+
+  if (this.connector.discoverSchemas) {
+    // Delegate to the connector implementation
+    return this.connector.discoverSchemas(modelName, options, cb);
+  }
 
   var tasks = [
     this.discoverModelProperties.bind(this, modelName, options),
-    this.discoverPrimaryKeys.bind(this, modelName, options) ];
+    this.discoverPrimaryKeys.bind(this, modelName, options)];
 
   var followingRelations = options.associations || options.relations;
   if (followingRelations) {
@@ -1215,7 +1250,7 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
     }
 
     // Handle primary keys
-    var primaryKeys = results[1];
+    var primaryKeys = results[1] || [];
     var pks = {};
     primaryKeys.forEach(function (pk) {
       pks[pk.columnName] = pk.keySeq;
@@ -1226,15 +1261,14 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
     }
 
     var schema = {
-      name: fromDBName(modelName, false),
+      name: nameMapper('table', modelName),
       options: {
         idInjection: false // DO NOT add id property
       },
-      properties: {
-      }
+      properties: {}
     };
 
-    schema.options[schemaName] = {
+    schema.options[dbType] = {
       schema: columns[0].owner,
       table: modelName
     };
@@ -1242,10 +1276,11 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
     columns.forEach(function (item) {
       var i = item;
 
-      var propName = fromDBName(item.columnName, true);
+      var propName = nameMapper('column', item.columnName);
       schema.properties[propName] = {
         type: item.type,
-        required: (item.nullable === 'N'),
+        required: (item.nullable === 'N' || item.nullable === 'NO'
+        || item.nullable === 0 || item.nullable === false),
         length: item.dataLength,
         precision: item.dataPrecision,
         scale: item.dataScale
@@ -1254,7 +1289,7 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
       if (pks[item.columnName]) {
         schema.properties[propName].id = pks[item.columnName];
       }
-      schema.properties[propName][schemaName] = {
+      schema.properties[propName][dbType] = {
         columnName: i.columnName,
         dataType: i.dataType,
         dataLength: i.dataLength,
@@ -1278,7 +1313,7 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
     if (followingRelations) {
       // Handle foreign keys
       var fks = {};
-      var foreignKeys = results[2];
+      var foreignKeys = results[2] || [];
       foreignKeys.forEach(function (fk) {
         var fkInfo = {
           keySeq: fk.keySeq,
@@ -1299,11 +1334,11 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
 
       schema.options.relations = {};
       foreignKeys.forEach(function (fk) {
-        var propName = fromDBName(fk.pkTableName, true);
+        var propName = nameMapper('column', fk.pkTableName);
         schema.options.relations[propName] = {
-          model: fromDBName(fk.pkTableName, false),
+          model: nameMapper('table', fk.pkTableName),
           type: 'belongsTo',
-          foreignKey: fromDBName(fk.fkColumnName, true)
+          foreignKey: nameMapper('column', fk.fkColumnName)
         };
 
         var key = fk.pkOwner + '.' + fk.pkTableName;
@@ -1349,12 +1384,20 @@ DataSource.prototype.discoverSchemas = function (modelName, options, cb) {
  */
 DataSource.prototype.discoverSchemasSync = function (modelName, options) {
   var self = this;
-  var schemaName = this.name || this.connector.name;
+  var dbType = this.name || this.connector.name;
 
   var columns = this.discoverModelPropertiesSync(modelName, options);
   if (!columns || columns.length === 0) {
     return [];
   }
+
+  var nameMapper = options.nameMapper || function mapName(type, name) {
+    if (type === 'table' || type === 'model') {
+      return fromDBName(name, false);
+    } else {
+      return fromDBName(name, true);
+    }
+  };
 
   // Handle primary keys
   var primaryKeys = this.discoverPrimaryKeysSync(modelName, options);
@@ -1368,15 +1411,14 @@ DataSource.prototype.discoverSchemasSync = function (modelName, options) {
   }
 
   var schema = {
-    name: fromDBName(modelName, false),
+    name: nameMapper('table', modelName),
     options: {
       idInjection: false // DO NOT add id property
     },
-    properties: {
-    }
+    properties: {}
   };
 
-  schema.options[schemaName] = {
+  schema.options[dbType] = {
     schema: columns.length > 0 && columns[0].owner,
     table: modelName
   };
@@ -1384,7 +1426,7 @@ DataSource.prototype.discoverSchemasSync = function (modelName, options) {
   columns.forEach(function (item) {
     var i = item;
 
-    var propName = fromDBName(item.columnName, true);
+    var propName = nameMapper('column', item.columnName);
     schema.properties[propName] = {
       type: item.type,
       required: (item.nullable === 'N'),
@@ -1396,7 +1438,7 @@ DataSource.prototype.discoverSchemasSync = function (modelName, options) {
     if (pks[item.columnName]) {
       schema.properties[propName].id = pks[item.columnName];
     }
-    schema.properties[propName][schemaName] = {
+    schema.properties[propName][dbType] = {
       columnName: i.columnName,
       dataType: i.dataType,
       dataLength: i.dataLength,
@@ -1442,11 +1484,11 @@ DataSource.prototype.discoverSchemasSync = function (modelName, options) {
 
     schema.options.relations = {};
     foreignKeys.forEach(function (fk) {
-      var propName = fromDBName(fk.pkTableName, true);
+      var propName = nameMapper('column', fk.pkTableName);
       schema.options.relations[propName] = {
-        model: fromDBName(fk.pkTableName, false),
+        model: nameMapper('table', fk.pkTableName),
         type: 'belongsTo',
-        foreignKey: fromDBName(fk.fkColumnName, true)
+        foreignKey: nameMapper('column', fk.fkColumnName)
       };
 
       var key = fk.pkOwner + '.' + fk.pkTableName;
@@ -1599,7 +1641,7 @@ DataSource.prototype.log = function (sql, t) {
  * Freeze dataSource. Behavior depends on connector
  */
 DataSource.prototype.freeze = function freeze() {
-  if(!this.connector) {
+  if (!this.connector) {
     throw new Error('The connector has not been initialized.');
   }
   if (this.connector.freezeDataSource) {
@@ -1710,11 +1752,18 @@ DataSource.prototype.defineForeignKey = function defineForeignKey(className, key
     return;
   }
 
+  var fkDef = {type: pkType};
+  var foreignMeta = this.columnMetadata(foreignClassName, pkName);
+  if(foreignMeta && foreignMeta.dataType) {
+    fkDef[this.connector.name] = {};
+    fkDef[this.connector.name].dataType = foreignMeta.dataType;
+  }
   if (this.connector.defineForeignKey) {
     var cb = function (err, keyType) {
       if (err) throw err;
+      fkDef.type = keyType || pkType;
       // Add the foreign key property to the data source _models
-      this.defineProperty(className, key, {type: keyType || pkType});
+      this.defineProperty(className, key, fkDef);
     }.bind(this);
     switch (this.connector.defineForeignKey.length) {
       case 4:
@@ -1727,7 +1776,7 @@ DataSource.prototype.defineForeignKey = function defineForeignKey(className, key
     }
   } else {
     // Add the foreign key property to the data source _models
-    this.defineProperty(className, key, {type: pkType});
+    this.defineProperty(className, key, fkDef);
   }
 
 };
@@ -1848,7 +1897,7 @@ DataSource.prototype.enableRemote = function (operation) {
 /**
  * Disable remote access to a data source operation. Each [connector](#connector) has its own set of set enabled
  * and disabled operations. To list the operations, call `dataSource.operations()`.
- * 
+ *
  *```js
  * var oracle = loopback.createDataSource({
  *   connector: require('loopback-connector-oracle'),
@@ -1858,7 +1907,7 @@ DataSource.prototype.enableRemote = function (operation) {
  * oracle.disableRemote('destroyAll');
  * ```
  * **Notes:**
- * 
+ *
  * - Disabled operations will not be added to attached models.
  * - Disabling the remoting for a method only affects client access (it will still be available from server models).
  * - Data sources must enable / disable operations before attaching or creating models.
@@ -2058,4 +2107,3 @@ DataSource.Any = ModelBuilder.Any;
 DataSource.registerType = function (type) {
   ModelBuilder.registerType(type);
 };
-

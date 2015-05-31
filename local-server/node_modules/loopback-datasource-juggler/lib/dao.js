@@ -7,6 +7,7 @@ module.exports = DataAccessObject;
 /*!
  * Module dependencies
  */
+var async = require('async');
 var jutil = require('./jutil');
 var ValidationError = require('./validations').ValidationError;
 var Relation = require('./relations.js');
@@ -21,6 +22,8 @@ var setScopeValuesFromWhere = utils.setScopeValuesFromWhere;
 var mergeQuery = utils.mergeQuery;
 var util = require('util');
 var assert = require('assert');
+var BaseModel = require('./model');
+var debug = require('debug')('loopback:dao');
 
 /**
  * Base class for all persistent objects.
@@ -58,8 +61,17 @@ function byIdQuery(m, id) {
   var pk = idName(m);
   var query = { where: {} };
   query.where[pk] = id;
-  m.applyScope(query);
   return query;
+}
+
+function isWhereByGivenId(Model, where, idValue) {
+  var keys = Object.keys(where);
+  if (keys.length != 1) return false;
+
+  var pk = idName(Model);
+  if (keys[0] !== pk) return false;
+
+  return where[pk] === idValue;
 }
 
 DataAccessObject._forDB = function (data) {
@@ -89,7 +101,7 @@ DataAccessObject.defaultScope = function(target, inst) {
 DataAccessObject.applyScope = function(query, inst) {
   var scope = this.defaultScope(query, inst) || {};
   if (typeof scope === 'object') {
-    mergeQuery(query, scope || {}, this.definition.settings.scoping);
+    mergeQuery(query, scope || {}, this.definition.settings.scope);
   }
 };
 
@@ -113,6 +125,20 @@ DataAccessObject.lookupModel = function(data) {
 };
 
 /**
+ * Get the connector instance for the given model class
+ * @returns {Connector} The connector instance
+ */
+DataAccessObject.getConnector = function() {
+  return this.getDataSource().connector;
+}
+
+// Empty callback function
+function noCallback(err, result) {
+  // NOOP
+  debug('callback is ignored: err=%j, result=%j', err, result);
+}
+
+/**
  * Create an instance of Model with given data and save to the attached data source. Callback is optional.
  * Example:
  *```js
@@ -123,102 +149,130 @@ DataAccessObject.lookupModel = function(data) {
  * Note: You must include a callback and use the created model provided in the callback if your code depends on your model being
  * saved or having an ID.
  *
- * @param {Object} data  Optional data object
- * @param {Function} callback  Callback function called with these arguments:
+ * @param {Object} [data] Optional data object
+ * @param {Object} [options] Options for create
+ * @param {Function} [cb]  Callback function called with these arguments:
  *   - err (null or Error)
  *   - instance (null or Model)
  */
-DataAccessObject.create = function (data, callback) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
+DataAccessObject.create = function (data, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
+  }
 
   var Model = this;
+  var connector = Model.getConnector();
+  assert(typeof connector.create === 'function',
+    'create() must be implemented by the connector');
+
   var self = this;
-  
-  if (typeof data === 'function') {
-    callback = data;
-    data = {};
+
+  if (options === undefined && cb === undefined) {
+    if (typeof data === 'function') {
+      // create(cb)
+      cb = data;
+      data = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // create(data, cb);
+      cb = options;
+      options = {};
+    }
   }
 
-  if (typeof callback !== 'function') {
-    callback = function () {
-    };
-  }
+  data = data || {};
+  options = options || {};
+  cb = cb || (Array.isArray(data) ? noCallback : utils.createPromiseCallback());
 
-  if (!data) {
-    data = {};
-  }
+  assert(typeof data === 'object', 'The data argument must be an object or array');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  var hookState = {};
 
   if (Array.isArray(data)) {
-    var instances = [];
-    var errors = Array(data.length);
-    var gotError = false;
-    var wait = data.length;
-    if (wait === 0) {
-      callback(null, []);
-    }
-
-    for (var i = 0; i < data.length; i += 1) {
-      (function (d, i) {
-        Model = self.lookupModel(d); // data-specific
-        instances.push(Model.create(d, function (err, inst) {
-          if (err) {
-            errors[i] = err;
-            gotError = true;
-          }
-          modelCreated();
-        }));
-      })(data[i], i);
-    }
-
-    return instances;
-
-    function modelCreated() {
-      if (--wait === 0) {
-        callback(gotError ? errors : null, instances);
-        if(!gotError) {
-          instances.forEach(function(inst) {
-            inst.constructor.emit('changed');
-          });
-        }
+    // Undefined item will be skipped by async.map() which internally uses
+    // Array.prototype.map(). The following loop makes sure all items are
+    // iterated
+    for (var i = 0, n = data.length; i < n; i++) {
+      if (data[i] === undefined) {
+        data[i] = {};
       }
     }
+    async.map(data, function(item, done) {
+      self.create(item, options, function(err, result) {
+        // Collect all errors and results
+        done(null, {err: err, result: result || item});
+      });
+    }, function(err, results) {
+      if (err) {
+        return cb(err, results);
+      }
+      // Convert the results into two arrays
+      var errors = null;
+      var data = [];
+      for (var i = 0, n = results.length; i < n; i++) {
+        if (results[i].err) {
+          if (!errors) {
+            errors = [];
+          }
+          errors[i] = results[i].err;
+        }
+        data[i] = results[i].result;
+      }
+      cb(errors, data);
+    });
+    return data;
   }
-  
+
   var enforced = {};
   var obj;
   var idValue = getIdValue(this, data);
-  
+
   // if we come from save
   if (data instanceof Model && !idValue) {
     obj = data;
   } else {
     obj = new Model(data);
   }
-  
+
   this.applyProperties(enforced, obj);
   obj.setAttributes(enforced);
-  
+
   Model = this.lookupModel(data); // data-specific
   if (Model !== obj.constructor) obj = new Model(data);
-  
-  data = obj.toObject(true);
-  
-  // validation required
-  obj.isValid(function (valid) {
-    if (valid) {
-      create();
-    } else {
-      callback(new ValidationError(obj), obj);
-    }
-  }, data);
-  
+
+  var context = {
+    Model: Model,
+    instance: obj,
+    isNewInstance: true,
+    hookState: hookState,
+    options: options
+  };
+  Model.notifyObserversOf('before save', context, function(err) {
+    if (err) return cb(err);
+
+    data = obj.toObject(true);
+
+    // validation required
+    obj.isValid(function (valid) {
+      if (valid) {
+        create();
+      } else {
+        cb(new ValidationError(obj), obj);
+      }
+    }, data);
+  });
+
   function create() {
     obj.trigger('create', function (createDone) {
       obj.trigger('save', function (saveDone) {
-
         var _idName = idName(Model);
         var modelName = Model.modelName;
-        this._adapter().create(modelName, this.constructor._forDB(obj.toObject(true)), function (err, id, rev) {
+        var val = removeUndefined(obj.toObject(true));
+        function createCallback(err, id, rev) {
           if (id) {
             obj.__data[_idName] = id;
             defineReadonlyProp(obj, _idName, id);
@@ -227,26 +281,59 @@ DataAccessObject.create = function (data, callback) {
             obj._rev = rev;
           }
           if (err) {
-            return callback(err, obj);
+            return cb(err, obj);
           }
           obj.__persisted = true;
           saveDone.call(obj, function () {
             createDone.call(obj, function () {
-              callback(err, obj);
-              if(!err) Model.emit('changed', obj);
+              if (err) {
+                return cb(err, obj);
+              }
+              var context = {
+                Model: Model,
+                instance: obj,
+                isNewInstance: true,
+                hookState: hookState,
+                options: options
+              };
+              Model.notifyObserversOf('after save', context, function(err) {
+                cb(err, obj);
+                if(!err) Model.emit('changed', obj);
+              });
             });
           });
-        }, obj);
-      }, obj, callback);
-    }, obj, callback);
+        }
+
+        if (connector.create.length === 4) {
+          connector.create(modelName, this.constructor._forDB(val), options, createCallback);
+        } else {
+          connector.create(modelName, this.constructor._forDB(val), createCallback);
+        }
+      }, obj, cb);
+    }, obj, cb);
   }
 
+  // Does this make any sense? How would chaining be used here? -partap
+
   // for chaining
-  return obj;
+  return cb.promise || obj;
 };
 
 function stillConnecting(dataSource, obj, args) {
-  return dataSource.ready(obj, args);
+  if (typeof args[args.length-1] === 'function') {
+    return dataSource.ready(obj, args);
+  }
+
+  // promise variant
+  var promiseArgs = Array.prototype.slice.call(args);
+  promiseArgs.callee = args.callee
+  var cb =  utils.createPromiseCallback();
+  promiseArgs.push(cb);
+  if (dataSource.ready(obj, promiseArgs)) {
+    return cb.promise;
+  } else {
+    return false;
+  }
 }
 
 /**
@@ -256,57 +343,167 @@ function stillConnecting(dataSource, obj, args) {
  * NOTE: No setters, validations, or hooks are applied when using upsert.
  * `updateOrCreate` is an alias
  * @param {Object} data The model instance data
- * @param {Function} callback The callback function (optional).
+ * @param {Object} [options] Options for upsert
+ * @param {Function} cb The callback function (optional).
  */
 // [FIXME] rfeng: This is a hack to set up 'upsert' first so that
 // 'upsert' will be used as the name for strong-remoting to keep it backward
 // compatible for angular SDK
-DataAccessObject.updateOrCreate = DataAccessObject.upsert = function upsert(data, callback) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) {
-    return;
+DataAccessObject.updateOrCreate = DataAccessObject.upsert = function upsert(data, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
   }
+
+  if (options === undefined && cb === undefined) {
+    if (typeof data === 'function') {
+      // upsert(cb)
+      cb = data;
+      data = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // upsert(data, cb)
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
+  data = data || {};
+  options = options || {};
+
+  assert(typeof data === 'object', 'The data argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  var hookState = {};
+
   var self = this;
   var Model = this;
-  if (!getIdValue(this, data)) {
-    return this.create(data, callback);
+  var connector = Model.getConnector();
+
+  var id = getIdValue(this, data);
+  if (id === undefined || id === null) {
+    return this.create(data, options, cb);
   }
-  if (this.getDataSource().connector.updateOrCreate) {
-    var update = data;
-    var inst = data;
-    if(!(data instanceof Model)) {
-      inst = new Model(data);
+
+  var context = {
+    Model: Model,
+    query: byIdQuery(Model, id),
+    hookState: hookState,
+    options: options
+  };
+  Model.notifyObserversOf('access', context, doUpdateOrCreate);
+
+  function doUpdateOrCreate(err, ctx) {
+    if (err) return cb(err);
+
+    var isOriginalQuery = isWhereByGivenId(Model, ctx.query.where, id)
+    if (connector.updateOrCreate && isOriginalQuery) {
+      var context = {
+        Model: Model,
+        where: ctx.query.where,
+        data: data,
+        hookState: hookState,
+        options: options
+      };
+      Model.notifyObserversOf('before save', context, function(err, ctx) {
+        if (err) return cb(err);
+
+        data = ctx.data;
+        var update = data;
+        var inst = data;
+        if(!(data instanceof Model)) {
+          inst = new Model(data);
+        }
+        update = inst.toObject(false);
+
+        Model.applyProperties(update, inst);
+        Model = Model.lookupModel(update);
+
+        var connector = self.getConnector();
+
+        if (Model.settings.validateUpsert === false) {
+          update = removeUndefined(update);
+          if (connector.updateOrCreate.length === 4) {
+            connector.updateOrCreate(Model.modelName, update, options, done);
+          } else {
+            connector.updateOrCreate(Model.modelName, update, done);
+          }
+        } else {
+          inst.isValid(function(valid) {
+            if (!valid) {
+              if (Model.settings.validateUpsert) {
+                return cb(new ValidationError(inst), inst);
+              } else {
+                // TODO(bajtos) Remove validateUpsert:undefined in v3.0
+                console.warn('Ignoring validation errors in updateOrCreate():');
+                console.warn('  %s', new ValidationError(inst).message);
+                // continue with updateOrCreate
+              }
+            }
+
+            update = removeUndefined(update);
+            if (connector.updateOrCreate.length === 4) {
+              connector.updateOrCreate(Model.modelName, update, options, done);
+            } else {
+              connector.updateOrCreate(Model.modelName, update, done);
+            }
+          }, update);
+        }
+
+        function done(err, data, info) {
+          var obj;
+          if (data && !(data instanceof Model)) {
+            inst._initProperties(data, { persisted: true });
+            obj = inst;
+          } else {
+            obj = data;
+          }
+          if (err) {
+            cb(err, obj);
+            if(!err) {
+              Model.emit('changed', inst);
+            }
+          } else {
+            var context = {
+              Model: Model,
+              instance: obj,
+              isNewInstance: info ? info.isNewInstance : undefined,
+              hookState: hookState,
+              options: options
+            };
+            Model.notifyObserversOf('after save', context, function(err) {
+              cb(err, obj);
+              if(!err) {
+                Model.emit('changed', inst);
+              }
+            });
+          }
+        }
+      });
+    } else {
+      Model.findOne({ where: ctx.query.where }, { notify: false }, function (err, inst) {
+        if (err) {
+          return cb(err);
+        }
+        if (!isOriginalQuery) {
+          // The custom query returned from a hook may hide the fact that
+          // there is already a model with `id` value `data[idName(Model)]`
+          delete data[idName(Model)];
+        }
+        if (inst) {
+          inst.updateAttributes(data, options, cb);
+        } else {
+          Model = self.lookupModel(data);
+          var obj = new Model(data);
+          obj.save(options, cb);
+        }
+      });
     }
-    update = inst.toObject(false);
-    this.applyProperties(update, inst);
-    update = removeUndefined(update);
-    Model = this.lookupModel(update);
-    this.getDataSource().connector.updateOrCreate(Model.modelName, update, function (err, data) {
-      var obj;
-      if (data && !(data instanceof Model)) {
-        inst._initProperties(data);
-        obj = inst;
-      } else {
-        obj = data;
-      }
-      callback(err, obj);
-      if(!err) {
-        Model.emit('changed', inst);
-      }
-    });
-  } else {
-    this.findById(getIdValue(this, data), function (err, inst) {
-      if (err) {
-        return callback(err);
-      }
-      if (inst) {
-        inst.updateAttributes(data, callback);
-      } else {
-        Model = self.lookupModel(data);
-        var obj = new Model(data);
-        obj.save(data, callback);
-      }
-    });
   }
+  return cb.promise;
 };
 
 /**
@@ -317,45 +514,212 @@ DataAccessObject.updateOrCreate = DataAccessObject.upsert = function upsert(data
  * @param {Object} query Search conditions. See [find](#dataaccessobjectfindquery-callback) for query format.
  * For example: `{where: {test: 'me'}}`.
  * @param {Object} data Object to create.
- * @param {Function} cb Callback called with (err, instance)
+ * @param {Object} [options] Option for findOrCreate
+ * @param {Function} cb Callback called with (err, instance, created)
  */
-DataAccessObject.findOrCreate = function findOrCreate(query, data, callback) {
-  if (query === undefined) {
-    query = {where: {}};
-  }
-  if (typeof data === 'function' || typeof data === 'undefined') {
-    callback = data;
-    data = query && query.where;
-  }
-  if (typeof callback === 'undefined') {
-    callback = function () {
-    };
+DataAccessObject.findOrCreate = function findOrCreate(query, data, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
   }
 
-  var t = this;
-  this.findOne(query, function (err, record) {
-    if (err) return callback(err);
-    if (record) return callback(null, record);
-    t.create(data, callback);
-  });
+  assert(arguments.length >= 1, 'At least one argument is required');
+  if (data === undefined && options === undefined && cb === undefined) {
+    assert(typeof query === 'object', 'Single argument must be data object');
+    // findOrCreate(data);
+    // query will be built from data, and method will return Promise
+    data = query;
+    query = {where: data};
+  } else  if (options === undefined && cb === undefined) {
+    if (typeof data === 'function') {
+      // findOrCreate(data, cb);
+      // query will be built from data
+      cb = data;
+      data = query;
+      query = {where: data};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // findOrCreate(query, data, cb)
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
+  query = query || {where: {}};
+  data = data || {};
+  options = options || {};
+
+  assert(typeof query === 'object', 'The query argument must be an object');
+  assert(typeof data === 'object', 'The data argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  var hookState = {};
+
+  var Model = this;
+  var self = this;
+  var connector = Model.getConnector();
+
+  function _findOrCreate(query, data) {
+    var modelName = self.modelName;
+    data = removeUndefined(data);
+    function findOrCreateCallback(err, data, created) {
+      var obj, Model = self.lookupModel(data);
+
+      if (data) {
+        obj = new Model(data, {fields: query.fields, applySetters: false,
+          persisted: true});
+      }
+
+      if (created) {
+        var context = {
+          Model: Model,
+          instance: obj,
+          isNewInstance: true,
+          hookState: hookState,
+          options: options
+        };
+        Model.notifyObserversOf('after save', context, function(err) {
+          if (cb.promise) {
+            cb(err, [obj, created]);
+          } else {
+            cb(err, obj, created);
+          }
+          if (!err) Model.emit('changed', obj);
+        });
+      } else {
+        if (cb.promise) {
+          cb(err, [obj, created]);
+        } else {
+          cb(err, obj, created);
+        }
+      }
+    }
+
+    if (connector.findOrCreate.length === 5) {
+      connector.findOrCreate(modelName, query, self._forDB(data), options, findOrCreateCallback);
+    } else {
+      connector.findOrCreate(modelName, query, self._forDB(data), findOrCreateCallback);
+    }
+  }
+
+  if (connector.findOrCreate) {
+    query.limit = 1;
+
+    try {
+      this._normalize(query);
+    } catch (err) {
+      process.nextTick(function () {
+        cb(err);
+      });
+      return cb.promise;
+    }
+
+    this.applyScope(query);
+
+    var context = {
+      Model: Model,
+      query: query,
+      hookState: hookState,
+      options: options
+    };
+    Model.notifyObserversOf('access', context, function (err, ctx) {
+      if (err) return cb(err);
+
+      var query = ctx.query;
+
+      var enforced = {};
+      var Model = self.lookupModel(data);
+      var obj = data instanceof Model ? data : new Model(data);
+
+      Model.applyProperties(enforced, obj);
+      obj.setAttributes(enforced);
+
+      var context = {
+        Model: Model,
+        instance: obj,
+        isNewInstance: true,
+        hookState: hookState,
+        options: options
+       };
+      Model.notifyObserversOf('before save', context, function(err, ctx) {
+        if (err) return cb(err);
+
+        var obj = ctx.instance;
+        var data = obj.toObject(true);
+
+        // validation required
+        obj.isValid(function (valid) {
+          if (valid) {
+            _findOrCreate(query, data);
+          } else {
+            cb(new ValidationError(obj), obj);
+          }
+        }, data);
+      });
+    });
+  } else {
+    Model.findOne(query, options, function (err, record) {
+      if (err) return cb(err);
+      if (record) {
+        if (cb.promise) {
+          return cb(null, [record, false]);
+        } else {
+          return cb(null, record, false);
+        }
+      }
+      Model.create(data, options, function (err, record) {
+        if (cb.promise) {
+          cb(err, [record, record != null]);
+        } else {
+          cb(err, record, record != null);
+        }
+      });
+    });
+  }
+  return cb.promise;
 };
 
 /**
  * Check whether a model instance exists in database
  *
  * @param {id} id Identifier of object (primary key value)
+ * @param {Object} [options] Options
  * @param {Function} cb Callback function called with (err, exists: Bool)
  */
-DataAccessObject.exists = function exists(id, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
+DataAccessObject.exists = function exists(id, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+
+  assert(arguments.length >= 1, 'The id argument is required');
+  if (cb === undefined) {
+    if (typeof options === 'function') {
+      // exists(id, cb)
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
+  options = options || {};
+
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
 
   if (id !== undefined && id !== null && id !== '') {
-    this.count(byIdQuery(this, id).where, function(err, count) {
+    this.count(byIdQuery(this, id).where, options, function(err, count) {
       cb(err, err ? false : count === 1);
     });
   } else {
-    cb(new Error('Model::exists requires the id argument'));
+    process.nextTick(function() {
+      cb(new Error('Model::exists requires the id argument'));
+    });
   }
+  return cb.promise;
 };
 
 /**
@@ -369,31 +733,108 @@ DataAccessObject.exists = function exists(id, cb) {
  * ```
  *
  * @param {*} id Primary key value
+ * @param {Object} [filter] The filter that contains `include` or `fields`.
+ * Other settings such as `where`, `order`, `limit`, or `offset` will be
+ * ignored.
+ * @param {Object} [options] Options
  * @param {Function} cb Callback called with (err, instance)
  */
-DataAccessObject.findById = function find(id, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
-  this.findOne(byIdQuery(this, id), cb);
+DataAccessObject.findById = function findById(id, filter, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+
+  assert(arguments.length >= 1, 'The id argument is required');
+
+  if (options === undefined && cb === undefined) {
+    if (typeof filter === 'function') {
+      // findById(id, cb)
+      cb = filter;
+      filter = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // findById(id, query, cb)
+      cb = options;
+      options = {};
+      if (typeof filter === 'object' && !(filter.include || filter.fields)) {
+        // If filter doesn't have include or fields, assuming it's options
+        options = filter;
+        filter = {};
+      }
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
+  options = options || {};
+  filter = filter || {};
+
+  assert(typeof filter === 'object', 'The filter argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  if (id == null || id === '') {
+    process.nextTick(function() {
+      cb(new Error('Model::findById requires the id argument'));
+    });
+  } else {
+    var query = byIdQuery(this, id);
+    if (filter.include) {
+      query.include = filter.include;
+    }
+    if (filter.fields) {
+      query.fields = filter.fields;
+    }
+    this.findOne(query, options, cb);
+  }
+  return cb.promise;
 };
 
-DataAccessObject.findByIds = function(ids, cond, cb) {
-  if (typeof cond === 'function') {
-    cb = cond;
-    cond = {};
+/**
+ * Find model instances by ids
+ * @param {Array} ids An array of ids
+ * @param {Object} query Query filter
+ * @param {Object} [options] Options
+ * @param {Function} cb Callback called with (err, instance)
+ */
+DataAccessObject.findByIds = function(ids, query, options, cb) {
+  if (options === undefined && cb === undefined) {
+    if (typeof query === 'function') {
+      // findByIds(ids, cb)
+      cb = query;
+      query = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // findByIds(ids, query, cb)
+      cb = options;
+      options = {};
+    }
   }
-  
+
+  cb = cb || utils.createPromiseCallback();
+  options = options || {};
+  query = query || {};
+
+  assert(Array.isArray(ids), 'The ids argument must be an array');
+  assert(typeof query === 'object', 'The query argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
   var pk = idName(this);
   if (ids.length === 0) {
     process.nextTick(function() { cb(null, []); });
-    return;
+    return cb.promise;;
   }
-  
+
   var filter = { where: {} };
   filter.where[pk] = { inq: [].concat(ids) };
-  mergeQuery(filter, cond || {});
-  this.find(filter, function(err, results) {
+  mergeQuery(filter, query || {});
+  this.find(filter, options, function(err, results) {
     cb(err, err ? results : utils.sortObjectsByIds(pk, ids, results));
-  }.bind(this));
+  });
+  return cb.promise;
 };
 
 function convertNullToNotFoundError(ctx, cb) {
@@ -409,7 +850,7 @@ function convertNullToNotFoundError(ctx, cb) {
 
 // alias function for backwards compat.
 DataAccessObject.all = function () {
-  DataAccessObject.find.apply(this, arguments);
+  return DataAccessObject.find.apply(this, arguments);
 };
 
 var operators = {
@@ -506,7 +947,7 @@ DataAccessObject._normalize = function (filter) {
   // normalize fields as array of included property names
   if (filter.fields) {
     filter.fields = fieldsToArray(filter.fields,
-      Object.keys(this.definition.properties));
+      Object.keys(this.definition.properties), this.settings.strict);
   }
 
   filter = removeUndefined(filter);
@@ -515,17 +956,28 @@ DataAccessObject._normalize = function (filter) {
 };
 
 function DateType(arg) {
-  return new Date(arg);
+  var d = new Date(arg);
+  if (isNaN(d.getTime())) {
+    throw new Error('Invalid date: ' + arg);
+  }
+  return d;
 }
 
-function BooleanType(val) {
-  if (val === 'true') {
-    return true;
-  } else if (val === 'false') {
-    return false;
-  } else {
-    return Boolean(val);
+function BooleanType(arg) {
+  if (typeof arg === 'string') {
+    switch (arg) {
+      case 'true':
+      case '1':
+        return true;
+      case 'false':
+      case '0':
+        return false;
+    }
   }
+  if (arg == null) {
+    return null;
+  }
+  return Boolean(arg);
 }
 
 function NumberType(val) {
@@ -589,6 +1041,10 @@ DataAccessObject._coerce = function (where) {
     }
 
     if (!DataType) {
+      continue;
+    }
+
+    if (DataType.prototype instanceof BaseModel) {
       continue;
     }
 
@@ -722,141 +1178,236 @@ DataAccessObject._coerce = function (where) {
  *  - `{foo: true}` - include only foo
  * - `{bat: false}` - include all properties, exclude bat
  *
- * @param {Function} callback Required callback function.  Call this function with two arguments: `err` (null or Error) and an array of instances.
+ * @param {Function} cb Required callback function.  Call this function with two arguments: `err` (null or Error) and an array of instances.
  */
 
-DataAccessObject.find = function find(query, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
-
-  if (arguments.length === 1) {
-    cb = query;
-    query = null;
+DataAccessObject.find = function find(query, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
   }
-  var self = this;
 
+  if (options === undefined && cb === undefined) {
+    if (typeof query === 'function') {
+      // find(cb);
+      cb = query;
+      query = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // find(query, cb);
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
   query = query || {};
-  
+  options = options || {};
+
+  assert(typeof query === 'object', 'The query argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  var hookState = {};
+  var self = this;
+  var connector = self.getConnector();
+
+  assert(typeof connector.all === 'function',
+    'all() must be implemented by the connector');
+
   try {
     this._normalize(query);
   } catch (err) {
-    return process.nextTick(function () {
-      cb && cb(err);
+    process.nextTick(function () {
+      cb(err);
     });
+    return cb.promise;
   }
 
   this.applyScope(query);
-  
+
   var near = query && geo.nearFilter(query.where);
-  var supportsGeo = !!this.getDataSource().connector.buildNearFilter;
+  var supportsGeo = !!connector.buildNearFilter;
 
   if (near) {
     if (supportsGeo) {
       // convert it
-      this.getDataSource().connector.buildNearFilter(query, near);
+      connector.buildNearFilter(query, near);
     } else if (query.where) {
       // do in memory query
       // using all documents
       // TODO [fabien] use default scope here?
-      this.getDataSource().connector.all(this.modelName, {}, function (err, data) {
-        var memory = new Memory();
-        var modelName = self.modelName;
 
-        if (err) {
-          cb(err);
-        } else if (Array.isArray(data)) {
-          memory.define({
-            properties: self.dataSource.definitions[self.modelName].properties,
-            settings: self.dataSource.definitions[self.modelName].settings,
-            model: self
-          });
+      var context = {
+        Model: self,
+        query: query,
+        hookState: hookState,
+        options: options
+      };
+      self.notifyObserversOf('access', context, function(err, ctx) {
+        if (err) return cb(err);
 
-          data.forEach(function (obj) {
-            memory.create(modelName, obj, function () {
-              // noop
+        function geoCallback(err, data) {
+          var memory = new Memory();
+          var modelName = self.modelName;
+
+          if (err) {
+            cb(err);
+          } else if (Array.isArray(data)) {
+            memory.define({
+              properties: self.dataSource.definitions[self.modelName].properties,
+              settings: self.dataSource.definitions[self.modelName].settings,
+              model: self
             });
-          });
 
-          memory.all(modelName, query, cb);
-        } else {
-          cb(null, []);
+            data.forEach(function(obj) {
+              memory.create(modelName, obj, options, function() {
+                // noop
+              });
+            });
+
+            // FIXME: apply "includes" and other transforms - see allCb below
+            memory.all(modelName, ctx.query, options, cb);
+          } else {
+            cb(null, []);
+          }
         }
-      }.bind(this));
+
+        if (connector.all.length === 4) {
+          connector.all(self.modelName, {}, options, geoCallback);
+        } else {
+          connector.all(self.modelName, {}, geoCallback);
+        }
+      });
 
       // already handled
-      return;
+      return cb.promise;
     }
   }
 
-  this.getDataSource().connector.all(this.modelName, query, function (err, data) {
-    if (data && data.forEach) {
-      data.forEach(function (d, i) {
+  var allCb = function(err, data) {
+    var results = [];
+    if (Array.isArray(data)) {
+      for (var i = 0, n = data.length; i < n; i++) {
+        var d = data[i];
         var Model = self.lookupModel(d);
         var obj = new Model(d, {fields: query.fields, applySetters: false, persisted: true});
-        
+
         if (query && query.include) {
           if (query.collect) {
             // The collect property indicates that the query is to return the
-            // standlone items for a related model, not as child of the parent object
+            // standalone items for a related model, not as child of the parent object
             // For example, article.tags
             obj = obj.__cachedRelations[query.collect];
+            if (obj === null) {
+              obj = undefined;
+            }
           } else {
             // This handles the case to return parent items including the related
             // models. For example, Article.find({include: 'tags'}, ...);
             // Try to normalize the include
             var includes = Inclusion.normalizeInclude(query.include || []);
-            includes.forEach(function (inc) {
+            includes.forEach(function(inc) {
               var relationName = inc;
               if (utils.isPlainObject(inc)) {
                 relationName = Object.keys(inc)[0];
               }
-              
+
               // Promote the included model as a direct property
-              var data = obj.__cachedRelations[relationName];
-              if(Array.isArray(data)) {
-                data = new List(data, null, obj);
+              var included = obj.__cachedRelations[relationName];
+              if (Array.isArray(included)) {
+                included = new List(included, null, obj);
               }
-              if (data) obj.__data[relationName] = data;
+              if (included) obj.__data[relationName] = included;
             });
             delete obj.__data.__cachedRelations;
           }
         }
-        data[i] = obj;
-      });
+        if (obj !== undefined) {
+          results.push(obj);
+        }
+      }
 
       if (data && data.countBeforeLimit) {
-        data.countBeforeLimit = data.countBeforeLimit;
+        results.countBeforeLimit = data.countBeforeLimit;
       }
       if (!supportsGeo && near) {
-        data = geo.filter(data, near);
+        results = geo.filter(results, near);
       }
 
-      cb(err, data);
+      cb(err, results);
     }
     else
       cb(err, []);
-  });
+  };
+
+  if (options.notify === false) {
+    if (connector.all.length === 4) {
+      connector.all(self.modelName, query, options, allCb);
+    } else {
+      connector.all(self.modelName, query, allCb);
+    }
+  } else {
+    var context =  {
+      Model: this,
+      query: query,
+      hookState: hookState,
+      options: options
+    };
+    this.notifyObserversOf('access', context, function(err, ctx) {
+      if (err) return cb(err);
+      var query = ctx.query;
+      if (connector.all.length === 4) {
+        connector.all(self.modelName, query, options, allCb);
+      } else {
+        connector.all(self.modelName, query, allCb);
+      }
+    });
+  }
+  return cb.promise;
 };
 
 /**
  * Find one record, same as `find`, but limited to one result. This function returns an object, not a collection.
  *
- * @param {Object} query Sarch conditions.  See [find](#dataaccessobjectfindquery-callback) for query format.
+ * @param {Object} query Search conditions.  See [find](#dataaccessobjectfindquery-callback) for query format.
  * For example: `{where: {test: 'me'}}`.
+ * @param {Object} [options] Options
  * @param {Function} cb Callback function called with (err, instance)
  */
-DataAccessObject.findOne = function findOne(query, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
-
-  if (typeof query === 'function') {
-    cb = query;
-    query = {};
+DataAccessObject.findOne = function findOne(query, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
   }
+
+  if (options === undefined && cb === undefined) {
+    if (typeof query === 'function') {
+      cb = query;
+      query = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
   query = query || {};
+  options = options || {};
+
+  assert(typeof query === 'object', 'The query argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
   query.limit = 1;
-  this.find(query, function (err, collection) {
+  this.find(query, options, function (err, collection) {
     if (err || !collection || !collection.length > 0) return cb(err, null);
     cb(err, collection[0]);
   });
+  return cb.promise;
 };
 
 /**
@@ -870,42 +1421,132 @@ DataAccessObject.findOne = function findOne(query, cb) {
  * ````
  *
  * @param {Object} [where] Optional object that defines the criteria.  This is a "where" object. Do NOT pass a filter object.
- * @param {Function} [cb] Callback called with (err)
+ * @param {Object) [options] Options
+ * @param {Function} [cb] Callback called with (err, info)
  */
-DataAccessObject.remove = DataAccessObject.deleteAll = DataAccessObject.destroyAll = function destroyAll(where, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
-  var Model = this;
-
-  if (!cb && 'function' === typeof where) {
-    cb = where;
-    where = undefined;
+DataAccessObject.remove = DataAccessObject.deleteAll = DataAccessObject.destroyAll = function destroyAll(where, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
   }
-  
+
+  var Model = this;
+  var connector = Model.getConnector();
+
+  assert(typeof connector.destroyAll === 'function',
+    'destroyAll() must be implemented by the connector');
+
+  if (options === undefined && cb === undefined) {
+    if (typeof where === 'function') {
+      cb = where;
+      where = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
+  where = where || {};
+  options = options || {};
+
+  assert(typeof where === 'object', 'The where argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  var hookState = {};
+
   var query = { where: where };
   this.applyScope(query);
   where = query.where;
-  
-  if (!where || (typeof where === 'object' && Object.keys(where).length === 0)) {
-    this.getDataSource().connector.destroyAll(this.modelName, function (err, data) {
-      cb && cb(err, data);
-      if(!err) Model.emit('deletedAll');
-    }.bind(this));
+
+  var context = {
+    Model: Model,
+    where: whereIsEmpty(where) ? {} : where,
+    hookState: hookState,
+    options: options
+  };
+
+  if (options.notify === false) {
+    doDelete(where);
   } else {
-    try {
-      // Support an optional where object
-      where = removeUndefined(where);
-      where = this._coerce(where);
-    } catch (err) {
-      return process.nextTick(function() {
-        cb && cb(err);
+    query = { where: whereIsEmpty(where) ? {} : where };
+    var context = {
+      Model: Model,
+      query: query,
+      hookState: hookState,
+      options: options
+    };
+    Model.notifyObserversOf('access', context, function(err, ctx) {
+        if (err) return cb(err);
+        var context = {
+          Model: Model,
+          where: ctx.query.where,
+          hookState: hookState,
+          options: options
+        };
+        Model.notifyObserversOf('before delete', context, function(err, ctx) {
+          if (err) return cb(err);
+          doDelete(ctx.where);
+        });
+      });
+  }
+
+  function doDelete(where) {
+    if (whereIsEmpty(where)) {
+      if (connector.destroyAll.length === 4) {
+        connector.destroyAll(Model.modelName, {}, options, done);
+      } else {
+        connector.destroyAll(Model.modelName, {}, done);
+      }
+    } else {
+      try {
+        // Support an optional where object
+        where = removeUndefined(where);
+        where = Model._coerce(where);
+      } catch (err) {
+        return process.nextTick(function() {
+          cb(err);
+        });
+      }
+
+      if (connector.destroyAll.length === 4) {
+        connector.destroyAll(Model.modelName, where, options, done);
+      } else {
+        connector.destroyAll(Model.modelName, where, done);
+      }
+
+    }
+
+    function done(err, info) {
+      if (err) return cb(err);
+
+      if (options.notify === false) {
+        return cb(err, info);
+      }
+
+      var context = {
+        Model: Model,
+        where: where,
+        hookState: hookState,
+        options: options
+      };
+      Model.notifyObserversOf('after delete', context, function(err) {
+        cb(err, info);
+        if (!err)
+          Model.emit('deletedAll', whereIsEmpty(where) ? undefined : where);
       });
     }
-    this.getDataSource().connector.destroyAll(this.modelName, where, function (err, data) {
-      cb && cb(err, data);
-      if(!err) Model.emit('deletedAll', where);
-    }.bind(this));
   }
+  return cb.promise;
 };
+
+function whereIsEmpty(where) {
+  return !where ||
+     (typeof where === 'object' && Object.keys(where).length === 0)
+}
 
 /**
  * Delete the record with the specified ID.
@@ -917,16 +1558,43 @@ DataAccessObject.remove = DataAccessObject.deleteAll = DataAccessObject.destroyA
 // [FIXME] rfeng: This is a hack to set up 'deleteById' first so that
 // 'deleteById' will be used as the name for strong-remoting to keep it backward
 // compatible for angular SDK
-DataAccessObject.removeById = DataAccessObject.destroyById = DataAccessObject.deleteById = function deleteById(id, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
+DataAccessObject.removeById = DataAccessObject.destroyById = DataAccessObject.deleteById = function deleteById(id, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+
+  assert(arguments.length >= 1, 'The id argument is required');
+  if (cb === undefined) {
+    if (typeof options === 'function') {
+      // destroyById(id, cb)
+      cb = options;
+      options = {};
+    }
+  }
+
+  options = options || {};
+  cb = cb || utils.createPromiseCallback();
+
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  if (id == null || id === '') {
+    process.nextTick(function() {
+      cb(new Error('Model::deleteById requires the id argument'));
+    });
+    return cb.promise;
+  }
+
   var Model = this;
-  
-  this.remove(byIdQuery(this, id).where, function(err) {
+
+  this.remove(byIdQuery(this, id).where, options, function(err) {
     if ('function' === typeof cb) {
       cb(err);
     }
     if(!err) Model.emit('deleted', id);
   });
+  return cb.promise;
 };
 
 /**
@@ -940,30 +1608,81 @@ DataAccessObject.removeById = DataAccessObject.destroyById = DataAccessObject.de
  * ```
  *
  * @param {Object} [where] Search conditions (optional)
+ * @param {Object} [options] Options
  * @param {Function} cb Callback, called with (err, count)
  */
-DataAccessObject.count = function (where, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
-
-  if (typeof where === 'function') {
-    cb = where;
-    where = null;
+DataAccessObject.count = function (where, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
   }
-  
+
+  if (options === undefined && cb === undefined) {
+    if (typeof where === 'function') {
+      // count(cb)
+      cb = where;
+      where = {};
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // count(where, cb)
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
+  where = where || {};
+  options = options || {};
+
+  assert(typeof where === 'object', 'The where argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  var Model = this;
+  var connector = Model.getConnector();
+  assert(typeof connector.count === 'function',
+    'count() must be implemented by the connector');
+  assert(connector.count.length >= 3,
+    'count() must take at least 3 arguments');
+
+  var hookState = {};
+
   var query = { where: where };
   this.applyScope(query);
   where = query.where;
-  
+
   try {
     where = removeUndefined(where);
     where = this._coerce(where);
   } catch (err) {
-    return process.nextTick(function () {
-      cb && cb(err);
+    process.nextTick(function () {
+      cb(err);
     });
+    return cb.promise;
   }
-  
-  this.getDataSource().connector.count(this.modelName, cb, where);
+
+  var context = {
+    Model: Model,
+    query: { where: where },
+    hookState: hookState,
+    options: options
+  };
+  this.notifyObserversOf('access', context, function(err, ctx) {
+    if (err) return cb(err);
+    where = ctx.query.where;
+
+    if (connector.count.length <= 3) {
+      // Old signature, please note where is the last
+      // count(model, cb, where)
+      connector.count(Model.modelName, cb, where);
+    } else {
+      // New signature
+      // count(model, where, options, cb)
+      connector.count(Model.modelName, where, options, cb);
+    }
+  });
+  return cb.promise;
 };
 
 /**
@@ -972,80 +1691,114 @@ DataAccessObject.count = function (where, cb) {
  * @options {Object} options Optional options to use.
  * @property {Boolean} validate Default is true.
  * @property {Boolean} throws  Default is false.
- * @param {Function} callback Callback function with err and object arguments
+ * @param {Function} cb Callback function with err and object arguments
  */
-DataAccessObject.prototype.save = function (options, callback) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
+DataAccessObject.prototype.save = function (options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
+  }
   var Model = this.constructor;
 
-  if (typeof options == 'function') {
-    callback = options;
+  if (typeof options === 'function') {
+    cb = options;
     options = {};
   }
 
-  callback = callback || function () {
-  };
+  cb = cb || utils.createPromiseCallback();
   options = options || {};
 
-  if (!('validate' in options)) {
+  assert(typeof options === 'object', 'The options argument should be an object');
+  assert(typeof cb === 'function', 'The cb argument should be a function');
+
+  if (this.isNewRecord()) {
+    return Model.create(this, options, cb);
+  }
+
+  var hookState = {};
+
+  if (options.validate === undefined) {
     options.validate = true;
   }
-  if (!('throws' in options)) {
+  if (options.throws === undefined) {
     options.throws = false;
   }
-  
+
   var inst = this;
-  var data = inst.toObject(true);
+  var connector = inst.getConnector();
   var modelName = Model.modelName;
-  
-  Model.applyProperties(data, this);
-  
-  if (this.isNewRecord()) {
-    return Model.create(this, callback);
-  } else {
+
+  var context = {
+    Model: Model,
+    instance: inst,
+    hookState: hookState,
+    options: options
+  };
+  Model.notifyObserversOf('before save', context, function(err) {
+    if (err) return cb(err);
+
+    var data = inst.toObject(true);
+    Model.applyProperties(data, inst);
     inst.setAttributes(data);
-  }
 
-  // validate first
-  if (!options.validate) {
-    return save();
-  }
+    // validate first
+    if (!options.validate) {
+      return save();
+    }
 
-  inst.isValid(function (valid) {
-    if (valid) {
-      save();
-    } else {
-      var err = new ValidationError(inst);
-      // throws option is dangerous for async usage
-      if (options.throws) {
-        throw err;
+    inst.isValid(function (valid) {
+      if (valid) {
+        save();
+      } else {
+        var err = new ValidationError(inst);
+        // throws option is dangerous for async usage
+        if (options.throws) {
+          throw err;
+        }
+        cb(err, inst);
       }
-      callback(err, inst);
+    });
+
+    // then save
+    function save() {
+      inst.trigger('save', function (saveDone) {
+        inst.trigger('update', function (updateDone) {
+          data = removeUndefined(data);
+          function saveCallback(err, unusedData, result) {
+            if (err) {
+              return cb(err, inst);
+            }
+            inst._initProperties(data, { persisted: true });
+            var context = {
+              Model: Model,
+              instance: inst,
+              isNewInstance: result && result.isNewInstance,
+              hookState: hookState,
+              options: options
+            };
+            Model.notifyObserversOf('after save', context, function(err) {
+              if (err) return cb(err, inst);
+              updateDone.call(inst, function () {
+                saveDone.call(inst, function () {
+                  cb(err, inst);
+                  if(!err) {
+                    Model.emit('changed', inst);
+                  }
+                });
+              });
+            });
+          }
+
+          if (connector.save.length === 4) {
+            connector.save(modelName, inst.constructor._forDB(data), options, saveCallback);
+          } else {
+            connector.save(modelName, inst.constructor._forDB(data), saveCallback);
+          }
+        }, data, cb);
+      }, data, cb);
     }
   });
-
-  // then save
-  function save() {
-    inst.trigger('save', function (saveDone) {
-      inst.trigger('update', function (updateDone) {
-        data = removeUndefined(data);
-        inst._adapter().save(modelName, inst.constructor._forDB(data), function (err) {
-          if (err) {
-            return callback(err, inst);
-          }
-          inst._initProperties(data, { persisted: true });
-          updateDone.call(inst, function () {
-            saveDone.call(inst, function () {
-              callback(err, inst);
-              if(!err) {
-                Model.emit('changed', inst);
-              }
-            });
-          });
-        });
-      }, data, callback);
-    }, data, callback);
-  }
+  return cb.promise;
 };
 
 /**
@@ -1061,50 +1814,118 @@ DataAccessObject.prototype.save = function (options, callback) {
  *
  * @param {Object} [where] Search conditions (optional)
  * @param {Object} data Changes to be made
- * @param {Function} cb Callback, called with (err, count)
+ * @param {Object} [options] Options for update
+ * @param {Function} cb Callback, called with (err, info)
  */
 DataAccessObject.update =
-DataAccessObject.updateAll = function (where, data, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
+DataAccessObject.updateAll = function (where, data, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
+  }
 
-  if (arguments.length === 1) {
-    // update(data) is being called
+  assert(arguments.length >= 1, 'At least one argument is required');
+
+  if (data === undefined && options === undefined && cb === undefined && arguments.length === 1) {
     data = where;
-    where = null;
-    cb = null;
-  } else if (arguments.length === 2) {
+    where = {};
+  } else if (options === undefined && cb === undefined) {
+    // One of:
+    // updateAll(data, cb)
+    // updateAll(where, data) -> Promise
     if (typeof data === 'function') {
-      // update(data, cb) is being called
       cb = data;
       data = where;
-      where = null;
-    } else {
-      // update(where, data) is being called
-      cb = null;
+      where = {};
+    }
+
+  } else if (cb === undefined) {
+    // One of:
+    // updateAll(where, data, options) -> Promise
+    // updateAll(where, data, cb)
+    if (typeof options === 'function') {
+      cb = options;
+      options = {};
     }
   }
 
-  assert(typeof where === 'object', 'The where argument should be an object');
-  assert(typeof data === 'object', 'The data argument should be an object');
-  assert(cb === null || typeof cb === 'function', 'The cb argument should be a function');
-  
+  data = data || {};
+  options = options || {};
+  cb = cb || utils.createPromiseCallback();
+
+  assert(typeof where === 'object', 'The where argument must be an object');
+  assert(typeof data === 'object', 'The data argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
+
+  var Model = this;
+  var connector = Model.getDataSource().connector;
+  assert(typeof connector.update === 'function',
+    'update() must be implemented by the connector');
+
+  var hookState = {};
+
   var query = { where: where };
   this.applyScope(query);
   this.applyProperties(data);
-  
+
   where = query.where;
-  
-  try {
-    where = removeUndefined(where);
-    where = this._coerce(where);
-  } catch (err) {
-    return process.nextTick(function () {
-      cb && cb(err);
-    });
+
+  var context = {
+    Model: Model,
+    query: { where: where },
+    hookState: hookState,
+    options: options
+  };
+  Model.notifyObserversOf('access', context, function(err, ctx) {
+    if (err) return cb(err);
+    var context = {
+      Model: Model,
+      where: ctx.query.where,
+      data: data,
+      hookState: hookState,
+      options: options
+    };
+    Model.notifyObserversOf('before save', context,
+      function(err, ctx) {
+        if (err) return cb(err);
+        doUpdate(ctx.where, ctx.data);
+      });
+  });
+
+  function doUpdate(where, data) {
+    try {
+      where = removeUndefined(where);
+      where = Model._coerce(where);
+      data = removeUndefined(data);
+      data = Model._coerce(data);
+    } catch (err) {
+      return process.nextTick(function () {
+        cb(err);
+      });
+    }
+
+    function updateCallback(err, info) {
+      if (err) return cb (err);
+      var context = {
+        Model: Model,
+        where: where,
+        data: data,
+        hookState: hookState,
+        options: options
+      };
+      Model.notifyObserversOf('after save', context, function(err, ctx) {
+        return cb(err, info);
+      });
+    }
+
+    if (connector.update.length === 5) {
+      connector.update(Model.modelName, where, data, options, updateCallback);
+    } else {
+      connector.update(Model.modelName, where, data, updateCallback);
+    }
   }
-  
-  var connector = this.getDataSource().connector;
-  connector.update(this.modelName, where, data, cb);
+  return cb.promise;
 };
 
 DataAccessObject.prototype.isNewRecord = function () {
@@ -1115,7 +1936,7 @@ DataAccessObject.prototype.isNewRecord = function () {
  * Return connector of current record
  * @private
  */
-DataAccessObject.prototype._adapter = function () {
+DataAccessObject.prototype.getConnector = function () {
   return this.getDataSource().connector;
 };
 
@@ -1123,28 +1944,111 @@ DataAccessObject.prototype._adapter = function () {
  * Delete object from persistence
  *
  * Triggers `destroy` hook (async) before and after destroying object
+ *
+ * @param {Object} [options] Options for delete
+ * @param {Function} cb Callback
  */
 DataAccessObject.prototype.remove =
   DataAccessObject.prototype.delete =
-    DataAccessObject.prototype.destroy = function (cb) {
-      if (stillConnecting(this.getDataSource(), this, arguments)) return;
+    DataAccessObject.prototype.destroy = function (options, cb) {
+      var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+      if (connectionPromise) {
+        return connectionPromise;
+      }
+
+      if (cb === undefined && typeof options === 'function') {
+        cb = options;
+        options = {};
+      }
+
+      cb = cb || utils.createPromiseCallback();
+      options = options || {};
+
+      assert(typeof options === 'object', 'The options argument should be an object');
+      assert(typeof cb === 'function', 'The cb argument should be a function');
+
+      var inst = this;
+      var connector = this.getConnector();
+
       var Model = this.constructor;
       var id = getIdValue(this.constructor, this);
+      var hookState = {};
 
-      this.trigger('destroy', function (destroyed) {
-        this._adapter().destroy(this.constructor.modelName, id, function (err) {
-          if (err) {
-            return cb(err);
+      var context = {
+        Model: Model,
+        query: byIdQuery(Model, id),
+        hookState: hookState,
+        options: options
+      };
+
+      Model.notifyObserversOf('access', context, function(err, ctx) {
+          if (err) return cb(err);
+          var context = {
+            Model: Model,
+            where: ctx.query.where,
+            instance: inst,
+            hookState: hookState,
+            options: options
+          };
+          Model.notifyObserversOf('before delete', context, function(err, ctx) {
+              if (err) return cb(err);
+              doDeleteInstance(ctx.where);
+            });
+        });
+
+      function doDeleteInstance(where) {
+        if (!isWhereByGivenId(Model, where, id)) {
+          // A hook modified the query, it is no longer
+          // a simple 'delete model with the given id'.
+          // We must switch to full query-based delete.
+          Model.deleteAll(where, { notify: false }, function(err) {
+            if (err) return cb(err);
+            var context = {
+              Model: Model,
+              where: where,
+              instance: inst,
+              hookState: hookState,
+              options: options
+            };
+            Model.notifyObserversOf('after delete', context, function(err) {
+              cb(err);
+              if (!err) Model.emit('deleted', id);
+            });
+          });
+          return;
+        }
+
+        inst.trigger('destroy', function (destroyed) {
+          function destroyCallback(err) {
+            if (err) {
+              return cb(err);
+            }
+
+            destroyed(function() {
+              var context = {
+                Model: Model,
+                where: where,
+                instance: inst,
+                hookState: hookState,
+                options: options
+              };
+              Model.notifyObserversOf('after delete', context, function(err) {
+                cb(err);
+                if (!err) Model.emit('deleted', id);
+              });
+            });
           }
 
-          destroyed(function () {
-            if (cb) cb();
-            Model.emit('deleted', id);
-          });
-        }.bind(this));
-      }, null, cb);
+          if (connector.destroy.length === 4) {
+            connector.destroy(inst.constructor.modelName, id, options, destroyCallback);
+          } else {
+            connector.destroy(inst.constructor.modelName, id, destroyCallback);
+          }
+        }, null, cb);
+      }
+      return cb.promise;
     };
-    
+
 /**
  * Set a single attribute.
  * Equivalent to `setAttributes({name: value})`
@@ -1154,7 +2058,7 @@ DataAccessObject.prototype.remove =
  */
 DataAccessObject.prototype.setAttribute = function setAttribute(name, value) {
   this[name] = value; // TODO [fabien] - currently not protected by applyProperties
-};    
+};
 
 /**
  * Update a single attribute.
@@ -1162,12 +2066,12 @@ DataAccessObject.prototype.setAttribute = function setAttribute(name, value) {
  *
  * @param {String} name Name of property
  * @param {Mixed} value Value of property
- * @param {Function} callback Callback function called with (err, instance)
+ * @param {Function} cb Callback function called with (err, instance)
  */
-DataAccessObject.prototype.updateAttribute = function updateAttribute(name, value, callback) {
+DataAccessObject.prototype.updateAttribute = function updateAttribute(name, value, options, cb) {
   var data = {};
   data[name] = value;
-  this.updateAttributes(data, callback);
+  return this.updateAttributes(data, options, cb);
 };
 
 /**
@@ -1178,22 +2082,22 @@ DataAccessObject.prototype.updateAttribute = function updateAttribute(name, valu
  */
 DataAccessObject.prototype.setAttributes = function setAttributes(data) {
   if (typeof data !== 'object') return;
-  
+
   this.constructor.applyProperties(data, this);
-  
+
   var Model = this.constructor;
   var inst = this;
-  
+
   // update instance's properties
   for (var key in data) {
     inst.setAttribute(key, data[key]);
   }
-  
+
   Model.emit('set', inst);
 };
 
 DataAccessObject.prototype.unsetAttribute = function unsetAttribute(name, nullify) {
-  if (nullify) {
+  if (nullify || this.constructor.definition.settings.persistUndefinedAsNull) {
     this[name] = this.__data[name] = null;
   } else {
     delete this[name];
@@ -1201,39 +2105,115 @@ DataAccessObject.prototype.unsetAttribute = function unsetAttribute(name, nullif
   }
 };
 
+// Compare two id values to decide if updateAttributes is trying to change
+// the id value for a given instance
+function idEquals(id1, id2) {
+  if (id1 === id2) {
+    return true;
+  }
+  // Allows number/string conversions
+  if ((typeof id1 === 'number' && typeof id2 === 'string') ||
+    (typeof id1 === 'string' && typeof id2 === 'number')) {
+    return id1 == id2;
+  }
+  // For complex id types such as MongoDB ObjectID
+  id1 = JSON.stringify(id1);
+  id2 = JSON.stringify(id2);
+  if (id1 === id2) {
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * Update set of attributes.
  * Performs validation before updating.
  *
  * @trigger `validation`, `save` and `update` hooks
  * @param {Object} data Data to update
- * @param {Function} callback Callback function called with (err, instance)
+ * @param {Object} [options] Options for updateAttributes
+ * @param {Function} cb Callback function called with (err, instance)
  */
-DataAccessObject.prototype.updateAttributes = function updateAttributes(data, cb) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) return;
+DataAccessObject.prototype.updateAttributes = function updateAttributes(data, options, cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+
+  if (options === undefined && cb === undefined) {
+    if (typeof data === 'function') {
+      // updateAttributes(cb)
+      cb = data;
+      data = undefined;
+    }
+  } else if (cb === undefined) {
+    if (typeof options === 'function') {
+      // updateAttributes(data, cb)
+      cb = options;
+      options = {};
+    }
+  }
+
+  cb = cb || utils.createPromiseCallback();
+  options = options || {};
+
+  assert((typeof data === 'object') && (data !== null),
+    'The data argument must be an object');
+  assert(typeof options === 'object', 'The options argument must be an object');
+  assert(typeof cb === 'function', 'The cb argument must be a function');
 
   var inst = this;
   var Model = this.constructor;
+  var connector = inst.getConnector();
+  assert(typeof connector.updateAttributes === 'function',
+    'updateAttributes() must be implemented by the connector');
+
   var model = Model.modelName;
+  var hookState = {};
 
-  if (typeof data === 'function') {
-    cb = data;
-    data = null;
+  // Convert the data to be plain object so that update won't be confused
+  if (data instanceof Model) {
+    data = data.toObject(false);
+  }
+  data = removeUndefined(data);
+
+  // Make sure id(s) cannot be changed
+  var idNames = Model.definition.idNames();
+  for (var i = 0, n = idNames.length; i < n; i++) {
+    var idName = idNames[i];
+    if (data[idName] !== undefined && !idEquals(data[idName], inst[idName])) {
+      var err = new Error('id property (' + idName + ') ' +
+        'cannot be updated from ' + inst[idName] + ' to ' + data[idName]);
+      err.statusCode = 400;
+      return process.nextTick(function() {
+        cb(err);
+      });
+    }
   }
 
-  if (!data) {
-    data = {};
-  }
+  var context = {
+    Model: Model,
+    where: byIdQuery(Model, getIdValue(Model, inst)).where,
+    data: data,
+    currentInstance: inst,
+    hookState: hookState,
+    options: options
+  };
 
-  // update instance's properties
-  inst.setAttributes(data);
+  Model.notifyObserversOf('before save', context, function(err, ctx) {
+    if (err) return cb(err);
+    data = ctx.data;
 
-  inst.isValid(function (valid) {
-    if (!valid) {
-      if (cb) {
+    // update instance's properties
+    inst.setAttributes(data);
+
+    inst.isValid(function (valid) {
+      if (!valid) {
         cb(new ValidationError(inst), inst);
+        return;
       }
-    } else {
+
       inst.trigger('save', function (saveDone) {
         inst.trigger('update', function (done) {
           var typedData = {};
@@ -1242,41 +2222,60 @@ DataAccessObject.prototype.updateAttributes = function updateAttributes(data, cb
             // Convert the properties by type
             inst[key] = data[key];
             typedData[key] = inst[key];
-            if (typeof typedData[key] === 'object' 
+            if (typeof typedData[key] === 'object'
               && typedData[key] !== null
               && typeof typedData[key].toObject === 'function') {
               typedData[key] = typedData[key].toObject();
             }
           }
 
-          inst._adapter().updateAttributes(model, getIdValue(inst.constructor, inst),
-            inst.constructor._forDB(typedData), function (err) {
+          function updateAttributesCallback(err) {
             if (!err) inst.__persisted = true;
             done.call(inst, function () {
               saveDone.call(inst, function () {
-                if(cb) cb(err, inst);
-                if(!err) Model.emit('changed', inst);
+                if (err) return cb(err, inst);
+                var context = {
+                  Model: Model,
+                  instance: inst,
+                  isNewInstance: false,
+                  hookState: hookState,
+                  options: options
+                };
+                Model.notifyObserversOf('after save', context, function(err) {
+                  if(!err) Model.emit('changed', inst);
+                  cb(err, inst);
+                });
               });
             });
-          });
+          }
+
+          if (connector.updateAttributes.length === 5) {
+            connector.updateAttributes(model, getIdValue(inst.constructor, inst),
+              inst.constructor._forDB(typedData), options, updateAttributesCallback);
+          } else {
+            connector.updateAttributes(model, getIdValue(inst.constructor, inst),
+              inst.constructor._forDB(typedData), updateAttributesCallback);
+          }
         }, data, cb);
       }, data, cb);
-    }
-  }, data);
+    }, data);
+  });
+return cb.promise;
 };
 
 /**
  * Reload object from persistence
  * Requires `id` member of `object` to be able to call `find`
- * @param {Function} callback Called with (err, instance) arguments
+ * @param {Function} cb Called with (err, instance) arguments
  * @private
  */
-DataAccessObject.prototype.reload = function reload(callback) {
-  if (stillConnecting(this.getDataSource(), this, arguments)) {
-    return;
+DataAccessObject.prototype.reload = function reload(cb) {
+  var connectionPromise = stillConnecting(this.getDataSource(), this, arguments);
+  if (connectionPromise) {
+    return connectionPromise;
   }
 
-  this.constructor.findById(getIdValue(this.constructor, this), callback);
+  return this.constructor.findById(getIdValue(this.constructor, this), cb);
 };
 
 
@@ -1313,7 +2312,7 @@ DataAccessObject.scope = function (name, query, targetClass, methods, options) {
   if (options && options.isStatic === false) {
     cls = cls.prototype;
   }
-  defineScope(cls, targetClass || cls, name, query, methods, options);
+  return defineScope(cls, targetClass || cls, name, query, methods, options);
 };
 
 /*
@@ -1325,3 +2324,8 @@ jutil.mixin(DataAccessObject, Inclusion);
  * Add 'relation'
  */
 jutil.mixin(DataAccessObject, Relation);
+
+/*
+ * Add 'transaction'
+ */
+jutil.mixin(DataAccessObject, require('./transaction'));
