@@ -1,7 +1,10 @@
 module.exports = function(Magazine) {
-  Magazine.beforeCreate = function(next, model) {
-    console.log('> Magazine.beforeCreate triggered');
 
+  Magazine.observe('before save', function(ctx, next) {
+
+    console.log('> Magazine before save triggered');
+
+    var model = ctx.instance;
     var coffeeShopService = Magazine.app.dataSources.CoffeeShopService;
 
     coffeeShopService.find(function(err, response, context) {
@@ -14,5 +17,6 @@ module.exports = function(Magazine) {
       //verify via `curl localhost:3000/api/Magazines`
       next();
     });
-  };
+  });
+
 };
