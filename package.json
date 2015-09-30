@@ -16,5 +16,12 @@
   "bugs": {
     "url": "https://github.com/strongloop/loopback-example-rest-connector/issues"
   },
-  "homepage": "https://github.com/strongloop/loopback-example-rest-connector#readme"
+  "homepage": "https://github.com/strongloop/loopback-example-rest-connector#readme",
+  "main": "index.js",
+  "scripts": {
+    "test": "tape tests/**/*.js"
+  },
+  "devDependencies": {
+    "tape": "^4.2.0"
+  }
 }
